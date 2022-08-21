@@ -1,0 +1,104 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from prophet import Prophet
+
+
+####################################### train preprocessing
+file_path_train = r'train_dataset_train.csv'
+df = pd.read_csv(filepath_or_buffer=file_path_train, sep=';',
+                 parse_dates=['VISIT_MONTH_YEAR'])
+for key in df.keys():
+    print(f'{key} = {df[key].nunique()}')
+
+# преобразуем VISIT_MONTH_YEAR из object в datetime64
+df['VISIT_MONTH_YEAR'] = '01.' + df['VISIT_MONTH_YEAR']
+df['VISIT_MONTH_YEAR'] = df['VISIT_MONTH_YEAR'].str.split(pat='.')
+l_list = []
+for l in df['VISIT_MONTH_YEAR']:
+    l = l[::-1]
+    l = '.'.join(l)
+    l = '20' + l
+    l_list.append(l)
+df['VISIT_MONTH_YEAR'] = l_list
+df['VISIT_MONTH_YEAR'] = df['VISIT_MONTH_YEAR'].astype('datetime64')
+
+# преобразуем train в "широкую" таблицу со столбцами по времени
+table = pd.pivot_table(df, values='PATIENT_ID_COUNT',
+                       index=['ADRES', 'MKB_CODE', 'PATIENT_SEX', 'AGE_CATEGORY'],
+                       columns=['VISIT_MONTH_YEAR'], aggfunc=np.sum, fill_value=0)
+index = table.index.get_level_values
+z_list = list(zip(index(0), index(1), index(2), index(3)))
+
+######################################### test preprocessing
+file_path_test = r'test_dataset_test.csv'
+df_test = pd.read_csv(filepath_or_buffer=file_path_test, sep=';',
+                      parse_dates=['VISIT_MONTH_YEAR'])
+
+for key in df_test.keys():
+    print(f'{key} = {df_test[key].nunique()}')
+
+states = df['ADRES'].unique()
+states_test = df_test['ADRES'].unique()
+table = table.loc[states_test, :, :, :, :]
+for state in df_test['ADRES'].unique():
+    print(f'{state} is in {state in states}')
+
+#список, содержащий все пересечения df_test и table по полям:
+# 'ADRES', 'MKB_CODE', 'PATIENT_SEX', 'AGE_CATEGORY'
+z_list_test = []
+count = 0
+for i in df_test.index:
+    count += 1
+    if not count % 1000:
+        print(count)
+    k = (df_test.loc[i].ADRES, df_test.loc[i].MKB_CODE,
+         df_test.loc[i].PATIENT_SEX, df_test.loc[i].AGE_CATEGORY)
+    if k in z_list:
+        z_list_test.append(k)
+
+table = table.loc[z_list_test,:]
+
+# суммируем данные помесячно по всем полям
+data = table.sum()
+# переименновываем столбцы по требованию для пакета Prophet
+data = data.reset_index(name='y')
+data = data.rename(columns={"VISIT_MONTH_YEAR": "ds"})
+# тренируем модель, предсказываем на период +1
+m = Prophet(seasonality_mode='multiplicative')
+m.fit(data.loc[0:])
+future = m.make_future_dataframe(periods=1, freq='MS')
+fcst = m.predict(future)
+s_pred = fcst.iloc[-1].loc['yhat']
+# распределяем предсказанную сумму по полям в пропорциях предыдущего месяца
+pred = s_pred * table.loc[:, '2022-03-01'] / table.loc[:, '2022-03-01'].sum()
+
+# предсказания для сабмита первый шаг
+prediction = []
+count = 0
+for i in df_test.index:
+    count += 1
+    if not count % 1000:
+        print(count)
+    k = (df_test.loc[i].ADRES, df_test.loc[i].MKB_CODE,
+         df_test.loc[i].PATIENT_SEX, df_test.loc[i].AGE_CATEGORY)
+    if k in z_list:
+        prediction.append(int(pred.loc[k]))
+    else:
+        prediction.append(int(0))
+
+# предсказания для сабмита второй шаг (распределение с учетом округления на первом шаге)
+df_test["PATIENT_ID_COUNT"] = prediction
+df_test["PATIENT_ID_COUNT"] = df_test["PATIENT_ID_COUNT"] * s_pred / df_test["PATIENT_ID_COUNT"].sum()
+df_test["PATIENT_ID_COUNT"] = df_test["PATIENT_ID_COUNT"].round()
+df_test["PATIENT_ID_COUNT"] = df_test["PATIENT_ID_COUNT"].astype('int64')
+
+file_path_submit = r'submit.csv'
+df_test.to_csv(path_or_buf=file_path_submit, sep=';', index=False)
+
+plt.plot(data['ds'], data['y'])
+plt.plot(fcst['ds'], fcst['yhat'])
+plt.title('Суммарная заболеваемость населения\nв городах Калининградской обл.,\nвыбранных для прогнозирования')
+plt.ylabel('человек')
+plt.legend(['Реальные данные','Модель'], loc=2)
+plt.show()
